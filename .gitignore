@@ -152,3 +152,7 @@ request_llms/moss
 media
 flagged
 request_llms/ChatGLM-6b-onnx-u8s8
+.pre-commit-config.yaml
+themes/common.js.min.*.js
+test.html
+objdump*

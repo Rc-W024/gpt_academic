@@ -1,5 +1,3 @@
-# 借鉴了 https://github.com/GaiZhenbiao/ChuanhuChatGPT 项目
-
 """
     该文件中主要包含三个函数
 
@@ -11,17 +9,19 @@
 """
 
 import json
+import os
+import re
 import time
-import gradio as gr
 import logging
 import traceback
 import requests
-import importlib
 import random
 
 # config_private.py放自己的秘密如API和代理网址
 # 读取时首先看是否存在私密的config_private配置文件（不受git管控），如果有，则覆盖原config文件
-from toolbox import get_conf, update_ui, is_any_api_key, select_api_key, what_keys, clip_history, trimmed_format_exc, is_the_upload_folder
+from toolbox import get_conf, update_ui, is_any_api_key, select_api_key, what_keys, clip_history
+from toolbox import trimmed_format_exc, is_the_upload_folder, read_one_api_model_name, log_chat
+from toolbox import ChatBotWithCookies, have_any_recent_upload_image_files, encode_image
 proxies, TIMEOUT_SECONDS, MAX_RETRY, API_ORG, AZURE_CFG_ARRAY = \
     get_conf('proxies', 'TIMEOUT_SECONDS', 'MAX_RETRY', 'API_ORG', 'AZURE_CFG_ARRAY')
 
@@ -39,6 +39,57 @@ def get_full_error(chunk, stream_response):
             break
     return chunk
 
+def make_multimodal_input(inputs, image_paths):
+    image_base64_array = []
+    for image_path in image_paths:
+        path = os.path.abspath(image_path)
+        base64 = encode_image(path)
+        inputs = inputs + f'<br/><br/><div align="center"><img src="file={path}" base64="{base64}"></div>'
+        image_base64_array.append(base64)
+    return inputs, image_base64_array
+
+def reverse_base64_from_input(inputs):
+    # 定义一个正则表达式来匹配 Base64 字符串（假设格式为 base64="<Base64编码>"）
+    # pattern = re.compile(r'base64="([^"]+)"></div>')
+    pattern = re.compile(r'<br/><br/><div align="center"><img[^<>]+base64="([^"]+)"></div>')
+    # 使用 findall 方法查找所有匹配的 Base64 字符串
+    base64_strings = pattern.findall(inputs)
+    # 返回反转后的 Base64 字符串列表
+    return base64_strings
+
+def contain_base64(inputs):
+    base64_strings = reverse_base64_from_input(inputs)
+    return len(base64_strings) > 0
+
+def append_image_if_contain_base64(inputs):
+    if not contain_base64(inputs):
+        return inputs
+    else:
+        image_base64_array = reverse_base64_from_input(inputs)
+        pattern = re.compile(r'<br/><br/><div align="center"><img[^><]+></div>')
+        inputs = re.sub(pattern, '', inputs)
+        res = []
+        res.append({
+            "type": "text",
+            "text": inputs
+        })
+        for image_base64 in image_base64_array:
+            res.append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{image_base64}"
+                }
+            })
+        return res
+
+def remove_image_if_contain_base64(inputs):
+    if not contain_base64(inputs):
+        return inputs
+    else:
+        pattern = re.compile(r'<br/><br/><div align="center"><img[^><]+></div>')
+        inputs = re.sub(pattern, '', inputs)
+        return inputs
+
 def decode_chunk(chunk):
     # 提前读取一些信息 （用于判断异常）
     chunk_decoded = chunk.decode()
@@ -47,13 +98,14 @@ def decode_chunk(chunk):
     choice_valid = False
     has_content = False
     has_role = False
-    try: 
+    try:
         chunkjson = json.loads(chunk_decoded[6:])
         has_choices = 'choices' in chunkjson
         if has_choices: choice_valid = (len(chunkjson['choices']) > 0)
-        if has_choices and choice_valid: has_content = "content" in chunkjson['choices'][0]["delta"]
+        if has_choices and choice_valid: has_content = ("content" in chunkjson['choices'][0]["delta"])
+        if has_content: has_content = (chunkjson['choices'][0]["delta"]["content"] is not None)
         if has_choices and choice_valid: has_role = "role" in chunkjson['choices'][0]["delta"]
-    except: 
+    except:
         pass
     return chunk_decoded, chunkjson, has_choices, choice_valid, has_content, has_role
 
@@ -67,7 +119,7 @@ def verify_endpoint(endpoint):
         raise ValueError("Endpoint不正确, 请检查AZURE_ENDPOINT的配置! 当前的Endpoint为:" + endpoint)
     return endpoint
 
-def predict_no_ui_long_connection(inputs, llm_kwargs, history=[], sys_prompt="", observe_window=None, console_slience=False):
+def predict_no_ui_long_connection(inputs:str, llm_kwargs:dict, history:list=[], sys_prompt:str="", observe_window:list=None, console_slience:bool=False):
     """
     发送至chatGPT，等待回复，一次性完成，不显示中间过程。但内部用stream的方法避免中途网线被掐。
     inputs：
@@ -101,27 +153,35 @@ def predict_no_ui_long_connection(inputs, llm_kwargs, history=[], sys_prompt="",
     result = ''
     json_data = None
     while True:
-        try: chunk = next(stream_response).decode()
-        except StopIteration: 
+        try: chunk = next(stream_response)
+        except StopIteration:
             break
         except requests.exceptions.ConnectionError:
-            chunk = next(stream_response).decode() # 失败了，重试一次？再失败就没办法了。
-        if len(chunk)==0: continue
-        if not chunk.startswith('data:'): 
-            error_msg = get_full_error(chunk.encode('utf8'), stream_response).decode()
+            chunk = next(stream_response) # 失败了，重试一次？再失败就没办法了。
+        chunk_decoded, chunkjson, has_choices, choice_valid, has_content, has_role = decode_chunk(chunk)
+        if len(chunk_decoded)==0: continue
+        if not chunk_decoded.startswith('data:'):
+            error_msg = get_full_error(chunk, stream_response).decode()
             if "reduce the length" in error_msg:
                 raise ConnectionAbortedError("OpenAI拒绝了请求:" + error_msg)
+            elif """type":"upstream_error","param":"307""" in error_msg:
+                raise ConnectionAbortedError("正常结束，但显示Token不足，导致输出不完整，请削减单次输入的文本量。")
             else:
                 raise RuntimeError("OpenAI拒绝了请求：" + error_msg)
-        if ('data: [DONE]' in chunk): break # api2d 正常完成
-        json_data = json.loads(chunk.lstrip('data:'))['choices'][0]
+        if ('data: [DONE]' in chunk_decoded): break # api2d 正常完成
+        # 提前读取一些信息 （用于判断异常）
+        if has_choices and not choice_valid:
+            # 一些垃圾第三方接口的出现这样的错误
+            continue
+        json_data = chunkjson['choices'][0]
         delta = json_data["delta"]
         if len(delta) == 0: break
-        if "role" in delta: continue
-        if "content" in delta:
+        if (not has_content) and has_role: continue
+        if (not has_content) and (not has_role): continue # raise RuntimeError("发现不标准的第三方接口："+delta)
+        if has_content: # has_role = True/False
             result += delta["content"]
             if not console_slience: print(delta["content"], end='')
-            if observe_window is not None: 
+            if observe_window is not None:
                 # 观测窗，把已经获取的数据显示出去
                 if len(observe_window) >= 1:
                     observe_window[0] += delta["content"]
@@ -137,7 +197,8 @@ def predict_no_ui_long_connection(inputs, llm_kwargs, history=[], sys_prompt="",
     return result
 
 
-def predict(inputs, llm_kwargs, plugin_kwargs, chatbot, history=[], system_prompt='', stream = True, additional_fn=None):
+def predict(inputs:str, llm_kwargs:dict, plugin_kwargs:dict, chatbot:ChatBotWithCookies,
+            history:list=[], system_prompt:str='', stream:bool=True, additional_fn:str=None):
     """
     发送至chatGPT，流式获取输出。
     用于基础的对话功能。
@@ -147,6 +208,7 @@ def predict(inputs, llm_kwargs, plugin_kwargs, chatbot, history=[], system_promp
     chatbot 为WebUI中显示的对话列表，修改它，然后yeild出去，可以直接修改对话界面内容
     additional_fn代表点击的哪个按钮，按钮见functional.py
     """
+    from .bridge_all import model_info
     if is_any_api_key(inputs):
         chatbot._cookies['api_key'] = inputs
         chatbot.append(("输入已识别为openai的api_key", what_keys(inputs)))
@@ -162,9 +224,17 @@ def predict(inputs, llm_kwargs, plugin_kwargs, chatbot, history=[], system_promp
         from core_functional import handle_core_functionality
         inputs, history = handle_core_functionality(additional_fn, inputs, history, chatbot)
 
-    raw_input = inputs
-    logging.info(f'[raw_input] {raw_input}')
-    chatbot.append((inputs, ""))
+    # 多模态模型
+    has_multimodal_capacity = model_info[llm_kwargs['llm_model']].get('has_multimodal_capacity', False)
+    if has_multimodal_capacity:
+        has_recent_image_upload, image_paths = have_any_recent_upload_image_files(chatbot, pop=True)
+    else:
+        has_recent_image_upload, image_paths = False, []
+    if has_recent_image_upload:
+        _inputs, image_base64_array = make_multimodal_input(inputs, image_paths)
+    else:
+        _inputs, image_base64_array = inputs, []
+    chatbot.append((_inputs, ""))
     yield from update_ui(chatbot=chatbot, history=history, msg="等待响应") # 刷新界面
 
     # check mis-behavior
@@ -174,23 +244,26 @@ def predict(inputs, llm_kwargs, plugin_kwargs, chatbot, history=[], system_promp
         time.sleep(2)
 
     try:
-        headers, payload = generate_payload(inputs, llm_kwargs, history, system_prompt, stream)
+        headers, payload = generate_payload(inputs, llm_kwargs, history, system_prompt, image_base64_array, has_multimodal_capacity, stream)
     except RuntimeError as e:
         chatbot[-1] = (inputs, f"您提供的api-key不满足要求，不包含任何可用于{llm_kwargs['llm_model']}的api-key。您可能选择了错误的模型或请求源。")
         yield from update_ui(chatbot=chatbot, history=history, msg="api-key不满足要求") # 刷新界面
         return
-        
+
     # 检查endpoint是否合法
     try:
-        from .bridge_all import model_info
         endpoint = verify_endpoint(model_info[llm_kwargs['llm_model']]['endpoint'])
     except:
         tb_str = '```\n' + trimmed_format_exc() + '```'
         chatbot[-1] = (inputs, tb_str)
         yield from update_ui(chatbot=chatbot, history=history, msg="Endpoint不满足要求") # 刷新界面
         return
-    
-    history.append(inputs); history.append("")
+
+    # 加入历史
+    if has_recent_image_upload:
+        history.extend([_inputs, ""])
+    else:
+        history.extend([inputs, ""])
 
     retry = 0
     while True:
@@ -206,7 +279,7 @@ def predict(inputs, llm_kwargs, plugin_kwargs, chatbot, history=[], system_promp
             if retry > MAX_RETRY: raise TimeoutError
 
     gpt_replying_buffer = ""
-    
+
     is_head_of_the_stream = True
     if stream:
         stream_response =  response.iter_lines()
@@ -218,30 +291,34 @@ def predict(inputs, llm_kwargs, plugin_kwargs, chatbot, history=[], system_promp
                 chunk_decoded = chunk.decode()
                 error_msg = chunk_decoded
                 # 首先排除一个one-api没有done数据包的第三方Bug情形
-                if len(gpt_replying_buffer.strip()) > 0 and len(error_msg) == 0: 
+                if len(gpt_replying_buffer.strip()) > 0 and len(error_msg) == 0:
                     yield from update_ui(chatbot=chatbot, history=history, msg="检测到有缺陷的非OpenAI官方接口，建议选择更稳定的接口。")
                     break
                 # 其他情况，直接返回报错
                 chatbot, history = handle_error(inputs, llm_kwargs, chatbot, history, chunk_decoded, error_msg)
                 yield from update_ui(chatbot=chatbot, history=history, msg="非OpenAI官方接口返回了错误:" + chunk.decode()) # 刷新界面
                 return
-            
+
             # 提前读取一些信息 （用于判断异常）
             chunk_decoded, chunkjson, has_choices, choice_valid, has_content, has_role = decode_chunk(chunk)
 
             if is_head_of_the_stream and (r'"object":"error"' not in chunk_decoded) and (r"content" not in chunk_decoded):
                 # 数据流的第一帧不携带content
                 is_head_of_the_stream = False; continue
-            
+
             if chunk:
                 try:
                     if has_choices and not choice_valid:
                         # 一些垃圾第三方接口的出现这样的错误
                         continue
+                    if ('data: [DONE]' not in chunk_decoded) and len(chunk_decoded) > 0 and (chunkjson is None):
+                        # 传递进来一些奇怪的东西
+                        raise ValueError(f'无法读取以下数据，请检查配置。\n\n{chunk_decoded}')
                     # 前者是API2D的结束条件，后者是OPENAI的结束条件
                     if ('data: [DONE]' in chunk_decoded) or (len(chunkjson['choices'][0]["delta"]) == 0):
                         # 判定为数据流的结束，gpt_replying_buffer也写完了
-                        logging.info(f'[response] {gpt_replying_buffer}')
+                        # logging.info(f'[response] {gpt_replying_buffer}')
+                        log_chat(llm_model=llm_kwargs["llm_model"], input_str=inputs, output_str=gpt_replying_buffer)
                         break
                     # 处理数据流的主体
                     status_text = f"finish_reason: {chunkjson['choices'][0].get('finish_reason', 'null')}"
@@ -253,7 +330,8 @@ def predict(inputs, llm_kwargs, plugin_kwargs, chatbot, history=[], system_promp
                         # 一些第三方接口的出现这样的错误，兼容一下吧
                         continue
                     else:
-                        # 一些垃圾第三方接口的出现这样的错误
+                        # 至此已经超出了正常接口应该进入的范围，一些垃圾第三方接口会出现这样的错误
+                        if chunkjson['choices'][0]["delta"]["content"] is None: continue # 一些垃圾第三方接口出现这样的错误，兼容一下吧
                         gpt_replying_buffer = gpt_replying_buffer + chunkjson['choices'][0]["delta"]["content"]
 
                     history[-1] = gpt_replying_buffer
@@ -274,7 +352,7 @@ def handle_error(inputs, llm_kwargs, chatbot, history, chunk_decoded, error_msg)
     openai_website = ' 请登录OpenAI查看详情 https://platform.openai.com/signup'
     if "reduce the length" in error_msg:
         if len(history) >= 2: history[-1] = ""; history[-2] = "" # 清除当前溢出的输入：history[-2] 是本次输入, history[-1] 是本次输出
-        history = clip_history(inputs=inputs, history=history, tokenizer=model_info[llm_kwargs['llm_model']]['tokenizer'], 
+        history = clip_history(inputs=inputs, history=history, tokenizer=model_info[llm_kwargs['llm_model']]['tokenizer'],
                                                max_token_limit=(model_info[llm_kwargs['llm_model']]['max_token'])) # history至少释放二分之一
         chatbot[-1] = (chatbot[-1][0], "[Local Message] Reduce the length. 本次输入过长, 或历史数据过长. 历史缓存数据已部分释放, 您可以请再次尝试. (若再次失败则更可能是因为输入过长.)")
     elif "does not exist" in error_msg:
@@ -299,56 +377,109 @@ def handle_error(inputs, llm_kwargs, chatbot, history, chunk_decoded, error_msg)
         chatbot[-1] = (chatbot[-1][0], f"[Local Message] 异常 \n\n{tb_str} \n\n{regular_txt_to_markdown(chunk_decoded)}")
     return chatbot, history
 
-def generate_payload(inputs, llm_kwargs, history, system_prompt, stream):
+def generate_payload(inputs:str, llm_kwargs:dict, history:list, system_prompt:str, image_base64_array:list=[], has_multimodal_capacity:bool=False, stream:bool=True):
     """
     整合所有信息，选择LLM模型，生成http请求，为发送请求做准备
     """
     if not is_any_api_key(llm_kwargs['api_key']):
         raise AssertionError("你提供了错误的API_KEY。\n\n1. 临时解决方案：直接在输入区键入api_key，然后回车提交。\n\n2. 长效解决方案：在config.py中配置。")
 
-    api_key = select_api_key(llm_kwargs['api_key'], llm_kwargs['llm_model'])
+    if llm_kwargs['llm_model'].startswith('vllm-'):
+        api_key = 'no-api-key'
+    else:
+        api_key = select_api_key(llm_kwargs['api_key'], llm_kwargs['llm_model'])
 
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}"
     }
     if API_ORG.startswith('org-'): headers.update({"OpenAI-Organization": API_ORG})
-    if llm_kwargs['llm_model'].startswith('azure-'): 
+    if llm_kwargs['llm_model'].startswith('azure-'):
         headers.update({"api-key": api_key})
         if llm_kwargs['llm_model'] in AZURE_CFG_ARRAY.keys():
             azure_api_key_unshared = AZURE_CFG_ARRAY[llm_kwargs['llm_model']]["AZURE_API_KEY"]
             headers.update({"api-key": azure_api_key_unshared})
 
-    conversation_cnt = len(history) // 2
+    if has_multimodal_capacity:
+        # 当以下条件满足时，启用多模态能力：
+        # 1. 模型本身是多模态模型（has_multimodal_capacity）
+        # 2. 输入包含图像（len(image_base64_array) > 0）
+        # 3. 历史输入包含图像（ any([contain_base64(h) for h in history]) ）
+        enable_multimodal_capacity = (len(image_base64_array) > 0) or any([contain_base64(h) for h in history])
+    else:
+        enable_multimodal_capacity = False
 
-    messages = [{"role": "system", "content": system_prompt}]
-    if conversation_cnt:
-        for index in range(0, 2*conversation_cnt, 2):
-            what_i_have_asked = {}
-            what_i_have_asked["role"] = "user"
-            what_i_have_asked["content"] = history[index]
-            what_gpt_answer = {}
-            what_gpt_answer["role"] = "assistant"
-            what_gpt_answer["content"] = history[index+1]
-            if what_i_have_asked["content"] != "":
-                if what_gpt_answer["content"] == "": continue
-                if what_gpt_answer["content"] == timeout_bot_msg: continue
-                messages.append(what_i_have_asked)
-                messages.append(what_gpt_answer)
-            else:
-                messages[-1]['content'] = what_gpt_answer['content']
+    if not enable_multimodal_capacity:
+        # 不使用多模态能力
+        conversation_cnt = len(history) // 2
+        messages = [{"role": "system", "content": system_prompt}]
+        if conversation_cnt:
+            for index in range(0, 2*conversation_cnt, 2):
+                what_i_have_asked = {}
+                what_i_have_asked["role"] = "user"
+                what_i_have_asked["content"] = remove_image_if_contain_base64(history[index])
+                what_gpt_answer = {}
+                what_gpt_answer["role"] = "assistant"
+                what_gpt_answer["content"] = remove_image_if_contain_base64(history[index+1])
+                if what_i_have_asked["content"] != "":
+                    if what_gpt_answer["content"] == "": continue
+                    if what_gpt_answer["content"] == timeout_bot_msg: continue
+                    messages.append(what_i_have_asked)
+                    messages.append(what_gpt_answer)
+                else:
+                    messages[-1]['content'] = what_gpt_answer['content']
+        what_i_ask_now = {}
+        what_i_ask_now["role"] = "user"
+        what_i_ask_now["content"] = inputs
+        messages.append(what_i_ask_now)
+    else:
+        # 多模态能力
+        conversation_cnt = len(history) // 2
+        messages = [{"role": "system", "content": system_prompt}]
+        if conversation_cnt:
+            for index in range(0, 2*conversation_cnt, 2):
+                what_i_have_asked = {}
+                what_i_have_asked["role"] = "user"
+                what_i_have_asked["content"] = append_image_if_contain_base64(history[index])
+                what_gpt_answer = {}
+                what_gpt_answer["role"] = "assistant"
+                what_gpt_answer["content"] = append_image_if_contain_base64(history[index+1])
+                if what_i_have_asked["content"] != "":
+                    if what_gpt_answer["content"] == "": continue
+                    if what_gpt_answer["content"] == timeout_bot_msg: continue
+                    messages.append(what_i_have_asked)
+                    messages.append(what_gpt_answer)
+                else:
+                    messages[-1]['content'] = what_gpt_answer['content']
+        what_i_ask_now = {}
+        what_i_ask_now["role"] = "user"
+        what_i_ask_now["content"] = []
+        what_i_ask_now["content"].append({
+            "type": "text",
+            "text": inputs
+        })
+        for image_base64 in image_base64_array:
+            what_i_ask_now["content"].append({
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:image/jpeg;base64,{image_base64}"
+                }
+            })
+        messages.append(what_i_ask_now)
 
-    what_i_ask_now = {}
-    what_i_ask_now["role"] = "user"
-    what_i_ask_now["content"] = inputs
-    messages.append(what_i_ask_now)
+
     model = llm_kwargs['llm_model']
     if llm_kwargs['llm_model'].startswith('api2d-'):
         model = llm_kwargs['llm_model'][len('api2d-'):]
-
+    if llm_kwargs['llm_model'].startswith('one-api-'):
+        model = llm_kwargs['llm_model'][len('one-api-'):]
+        model, _ = read_one_api_model_name(model)
+    if llm_kwargs['llm_model'].startswith('vllm-'):
+        model = llm_kwargs['llm_model'][len('vllm-'):]
+        model, _ = read_one_api_model_name(model)
     if model == "gpt-3.5-random": # 随机选择, 绕过openai访问频率限制
         model = random.choice([
-            "gpt-3.5-turbo", 
+            "gpt-3.5-turbo",
             "gpt-3.5-turbo-16k",
             "gpt-3.5-turbo-1106",
             "gpt-3.5-turbo-0613",
@@ -359,13 +490,11 @@ def generate_payload(inputs, llm_kwargs, history, system_prompt, stream):
 
     payload = {
         "model": model,
-        "messages": messages, 
+        "messages": messages,
         "temperature": llm_kwargs['temperature'],  # 1.0,
         "top_p": llm_kwargs['top_p'],  # 1.0,
         "n": 1,
         "stream": stream,
-        "presence_penalty": 0,
-        "frequency_penalty": 0,
     }
     try:
         print(f" {llm_kwargs['llm_model']} : {conversation_cnt} : {inputs[:100]} ..........")
