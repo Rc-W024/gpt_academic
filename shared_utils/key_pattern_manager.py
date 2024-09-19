@@ -74,7 +74,7 @@ def select_api_key(keys, llm_model):
     avail_key_list = []
     key_list = keys.split(',')
 
-    if llm_model.startswith('gpt-') or llm_model.startswith('one-api-'):
+    if llm_model.startswith('gpt-') or llm_model.startswith('one-api-') or llm_model.startswith('o1-'):
         for k in key_list:
             if is_openai_api_key(k): avail_key_list.append(k)
 
@@ -92,6 +92,22 @@ def select_api_key(keys, llm_model):
 
     if len(avail_key_list) == 0:
         raise RuntimeError(f"您提供的api-key不满足要求，不包含任何可用于{llm_model}的api-key。您可能选择了错误的模型或请求源（左上角更换模型菜单中可切换openai,azure,claude,cohere等请求源）。")
+
+    api_key = random.choice(avail_key_list) # 随机负载均衡
+    return api_key
+
+
+def select_api_key_for_embed_models(keys, llm_model):
+    import random
+    avail_key_list = []
+    key_list = keys.split(',')
+
+    if llm_model.startswith('text-embedding-'):
+        for k in key_list:
+            if is_openai_api_key(k): avail_key_list.append(k)
+
+    if len(avail_key_list) == 0:
+        raise RuntimeError(f"您提供的api-key不满足要求，不包含任何可用于{llm_model}的api-key。您可能选择了错误的模型或请求源。")
 
     api_key = random.choice(avail_key_list) # 随机负载均衡
     return api_key
